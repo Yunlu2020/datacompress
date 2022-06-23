@@ -1,2 +1,7 @@
 # datacompress
 预训练中的数据选取
+
+dataset文件夹下包含三个下游任务数据集文件
+train文件夹下包含三个下游任务和bert预训练任务代码
+modelutils包含三个模型分别对应三个任务
+setting文件为配置文件
