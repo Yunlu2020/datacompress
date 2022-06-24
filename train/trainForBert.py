@@ -2,7 +2,7 @@ import argparse
 import random
 import time
 
-from transformers import BertForPreTraining
+from transformers import BertForPreTraining, BertTokenizer
 from torch.nn import DataParallel
 from torch.nn.parallel import DistributedDataParallel
 
@@ -14,6 +14,7 @@ import os
 
 from transformers import set_seed, \
     get_cosine_with_hard_restarts_schedule_with_warmup, BertConfig
+from transformers import DataCollatorForLanguageModeling
 
 from optim_schedule import ScheduledOptim
 from utils.checkpoint import save_checkpoint
@@ -27,6 +28,10 @@ class Train():
         timestamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
         logger = get_root_logger(os.path.join(args.output_dir, f'{timestamp}.log'))
         
+        self.tokenizer = BertTokenizer('bert-base-uncased')
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.data_collator = DataCollatorForLanguageModeling(tokenizer=self.tokenizer, mlm_probability=0.15)
+
         bert_config = BertConfig.from_pretrained('bert-base-uncased')
         self.net_without_ddp = BertForPreTraining(bert_config).cuda()
         # self.net_without_ddp = BertForPreTraining.from_pretrained('bert-base-uncased').cuda()
@@ -40,7 +45,9 @@ class Train():
         else:
             self.net = DataParallel(self.net_without_ddp)
         
-        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=args.lr, betas=args.betas,
+        self.optimizer = torch.optim.Adam(self.net.parameters(),
+                                          lr=args.lr,
+                                          betas=args.betas,
                                           weight_decay=args.weight_decay)
         self.path = args.c4_root
         self.epoch = 3
@@ -71,9 +78,15 @@ class Train():
         '''
             根据测试文件和训练文件载入dataloader
         '''
+
+        logger = get_root_logger()
+
         self.loadpath()
-        train_datasets = [Uncase_C4(root=path) for path in self.path_list['train']]
-        test_datasets = [Uncase_C4(root=path) for path in self.path_list['test']]
+        train_datasets = [Uncase_C4(root=path) for path in self.path_list['train'] if path.endswith('.json.gz')]
+        test_datasets = [Uncase_C4(root=path) for path in self.path_list['test'] if path.endswith('.json.gz')]
+
+        logger.info(f'Dataset: {sum([len(dataset) for dataset in train_datasets])} instances in train')
+        logger.info(f'Dataset: {sum([len(dataset) for dataset in test_datasets])} instances in test')
         
         if self.args.distributed:
             train_samplers = [torch.utils.data.DistributedSampler(dataset, shuffle=True) for dataset in train_datasets]
@@ -100,20 +113,25 @@ class Train():
         total_loss = 0
         self.net.train()
         for i, batch in loader:
-            token_ids, segments, attentionmask, all_mlm_labels, nsp_labels = [x.cuda() for x in batch]
+            # token_ids, segments, attentionmask, all_mlm_labels, nsp_labels = [x.cuda() for x in batch]
+            # token_ids, segments, attentionmask, all_mlm_labels, nsp_labels = [x.cuda() for x in batch]
+
+            self.data_collator(batch['sentences'])
             
             self.optimizer.zero_grad()
+            
             loss = self.net(input_ids=token_ids,
                             token_type_ids=segments,
                             attention_mask=attentionmask,
                             labels=all_mlm_labels,
                             next_sentence_label=nsp_labels)
+            
             loss.backward()
             # self.optimizer.step()
             self.optim_schedule.step_and_update_lr()
             total_loss += loss.item()
-            if i % 1000 == 0:
-                logger.info('average loss for 1000th', total_loss / 1000)
+            if i % self.args.log_interval == 0:
+                logger.info('average loss for 1000th', total_loss / self.args.log_interval)
                 total_loss = 0
         
         save_checkpoint(self.net,
@@ -135,6 +153,7 @@ class Train():
         '''
         logger = get_root_logger()
         count = 0
+        total_loss = 0
         for loader in self.loaders['test']:
             for i, batch in enumerate(loader):
                 total_loss = 0
@@ -144,7 +163,7 @@ class Train():
                                     masked_lm_labels=all_mlm_labels,
                                     next_sentence_label=nsp_labels)
                     total_loss += loss.item()
-                if i % 1000:
+                if i % self.args.log_interval:
                     logger.info(f'test total loss: {total_loss}')
                 count += 1
         
@@ -160,6 +179,9 @@ def main(args):
     
     set_seed(args.seed + args.local_rank)
     
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+    
     trainer = Train(args)
     trainer.train_net()
     trainer.test()
@@ -169,12 +191,16 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument("--local_rank", type=int, default=0)
-    parser.add_argument("--c4_root", type=str, default='./dataset/c4/en/')
+    
+    parser.add_argument("--c4_root", type=str, default='./dataset/c4/')
     parser.add_argument("--batch_size", type=int, default=128)
+    
+    parser.add_argument("--mlm", type=float, default=0.3)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--betas", type=list, default=(0.9, 0.999))
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_steps", type=int, default=10000)
+    parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--output_dir", type=str, default='./bert_base_log/')
     args = parser.parse_args()
     
