@@ -10,3 +10,5 @@ setting文件为配置文件
 pre-train bert on 4 3090 GPU. Run the command:
 
     python -m torch.distributed.launch --nproc_per_node 4 train/train.py --gradient_accumulation_steps 4
+
+    python -m torch.distributed.launch  --master_addr *** --master_port *** --nproc_per_node 4 train/train.py --gradient_accumulation_steps 4

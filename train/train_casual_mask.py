@@ -1,12 +1,13 @@
 import argparse
 import time
 
-import json
-from transformers import BertForPreTraining, BertTokenizer, TrainingArguments, Trainer, AutoModelForMaskedLM
+from src.utils.dist import is_master
+from transformers import BertForPreTraining, BertTokenizer, TrainingArguments, Trainer, AutoModelForMaskedLM, \
+    AutoModelForCausalLM
 from torch.nn import DataParallel
 from torch.nn.parallel import DistributedDataParallel
 
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import Dataset, DataLoader
 
 import torch
 import os
@@ -17,6 +18,7 @@ from transformers import DataCollatorForLanguageModeling
 
 from utils.logger import get_root_logger
 from datasets import load_dataset
+from torch.utils.data import Subset
 
 tokenizer = None
 
@@ -29,6 +31,8 @@ class C4DatasetWrapper(Dataset):
     
     def __getitem__(self, item):
         # text = dict(['text', 'url', 'timestamp']
+        if isinstance(item, torch.Tensor):
+            item = item.item()
         instance = self.dataset.__getitem__(item)
         return instance['text']
 
@@ -51,7 +55,7 @@ def main(args):
     
     set_seed(args.seed + args.local_rank)
     
-    if not os.path.exists(args.output_dir):
+    if is_master() and not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
     timestamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
@@ -60,25 +64,42 @@ def main(args):
     global tokenizer
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
     # tokenizer.pad_token = tokenizer.eos_token
-    data_collator = DataCollatorForLanguageModelingWrap(tokenizer=tokenizer, mlm_probability=args.mlm)
+    data_collator = DataCollatorForLanguageModelingWrap(tokenizer=tokenizer, mlm=False)
 
-    bert_config = BertConfig.from_pretrained('bert-base-uncased')
-    model_without_ddp = AutoModelForMaskedLM.from_config(bert_config).cuda()
-    # model_without_ddp = BertForPreTraining(bert_config).cuda()
-    # self.net_without_ddp = BertForPreTraining.from_pretrained('bert-base-uncased').cuda()
+    bert_config = BertConfig.from_pretrained('bert-base-uncased', is_decoder=True)
+    model_without_ddp = AutoModelForCausalLM.from_config(bert_config).cuda()
 
     model = model_without_ddp
 
     data_files = {"train": [f"en/c4-train.{i:05d}-of-01024.json.gz" for i in range(14)]}
 
     c4_train = load_dataset("allenai/c4", data_files=data_files, split="train", cache_dir='./dataset/')
-
-    c4_train = C4DatasetWrapper(c4_train)
-    
     c4_val = None
-    if args.train_split is not None:
-        train_indices = json.load(open(args.train_split, 'r'))
-        c4_train = Subset(c4_train, train_indices)
+    
+    c4_train = C4DatasetWrapper(c4_train)
+
+    dataset_generator = torch.Generator()
+    dataset_generator.manual_seed(42)
+    randperm = torch.randperm(len(c4_train), generator=dataset_generator)
+
+    train_len = int(len(c4_train) * args.ratio)
+
+    train_indices = randperm[:train_len]
+    val_indices = randperm[train_len:]
+
+    # We then pass the original dataset and the indices we are interested in
+    train_subset = Subset(c4_train, train_indices)
+    val_subset = Subset(c4_train, val_indices)
+    print(c4_train)
+
+    if args.split == 'train':
+        train_dataset = train_subset
+        logger.info("Using train set")
+    elif args.split == 'val':
+        train_dataset = val_subset
+        logger.info("Using val set")
+    else:
+        raise RuntimeError("Wrong split. Got {}.".format(args.split))
     
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -99,7 +120,7 @@ def main(args):
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=c4_train,
+        train_dataset=train_dataset,
         eval_dataset=c4_val,
         data_collator=data_collator,
         # no_deprecation_warning=True
@@ -113,12 +134,10 @@ if __name__ == '__main__':
     parser.add_argument("--local_rank", type=int, default=0)
     
     parser.add_argument("--c4_root", type=str, default='./dataset/c4/')
-    
-    parser.add_argument("--train_split", type=str, default=None)
-    
     parser.add_argument("--batch_size", type=int, default=16)
     
-    parser.add_argument("--mlm", type=float, default=0.3)
+    parser.add_argument("--ratio", type=float, default=0.7)
+    
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--betas", type=list, default=(0.9, 0.999))
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -131,7 +150,8 @@ if __name__ == '__main__':
     parser.add_argument("--debug", action='store_true')
     parser.add_argument("--resume_from", type=str, default=None)
 
-    parser.add_argument("--output_dir", type=str, default='./bert_base_log/')
+    parser.add_argument("--output_dir", type=str, default='./bert_base_causal_mask_log/')
+    parser.add_argument("--split", type=str, default='train')
     args = parser.parse_args()
     
     main(args)
